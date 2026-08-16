@@ -1,0 +1,141 @@
+# ==============================================================================
+# MODELO DE VECTORES AUTORREGRESIVOS (VAR) - NQH2O Y VARIABLES MACROECONÓMICAS
+# ==============================================================================
+
+# --- IMPORTACIÓN DE BIBLIOTECAS ---
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from statsmodels.tsa.api import VAR
+from statsmodels.tsa.stattools import adfuller
+from statsmodels.stats.stattools import durbin_watson
+from statsmodels.tsa.vector_ar.vecm import coint_johansen
+from statsmodels.stats.diagnostic import het_arch
+import warnings
+
+# Ignorar advertencias menores de compatibilidad en gráficos
+warnings.filterwarnings("ignore")
+
+# ==============================================================================
+# PASO 1: CARGA Y EXPLORACIÓN DE DATOS
+# ==============================================================================
+print("--- PASO 1: Carga de Datos ---")
+try:
+    df = pd.read_excel("Datos NQH2O 2.xlsx", sheet_name='Hoja1')
+    print(f"Datos cargados exitosamente. Dimensión: {df.shape}")
+except FileNotFoundError:
+    print("ERROR: El archivo 'Datos NQH2O 2.xlsx' no se encuentra en el directorio actual.")
+    exit()
+
+# ==============================================================================
+# PASO 2: PRUEBA DE ESTACIONARIEDAD (DICKEY-FULLER AUMENTADA)
+# ==============================================================================
+print("\n--- PASO 2: Prueba de Estacionariedad (ADF) ---")
+def adf_test(series, nombre, signif=0.05):
+    p_value = adfuller(series, autolag='AIC')[1]
+    estacionaria = p_value <= signif
+    print(f"{nombre:<10} | p-valor: {p_value:.4f} | Estacionaria: {estacionaria}")
+    return estacionaria
+
+todas_estacionarias = True
+for col in df.columns:
+    if not adf_test(df[col], col):
+        todas_estacionarias = False
+
+if todas_estacionarias:
+    print("-> Conclusión: Todas las series son estacionarias. Se modelará en niveles.")
+    df_model = df.copy()
+else:
+    print("-> Conclusión: Aplicando primera diferencia por presencia de raíces unitarias.")
+    df_model = df.diff().dropna()
+
+# ==============================================================================
+# PASO 3: SELECCIÓN DEL NÚMERO DE REZAGOS (LAGS) ÓPTIMO
+# ==============================================================================
+print("\n--- PASO 3: Selección de Rezagos Óptimos ---")
+modelo_preliminar = VAR(df_model)
+seleccion_orden = modelo_preliminar.select_order(maxlags=15)
+p_optimo = seleccion_orden.aic
+print(f"El rezago óptimo (p) según el Criterio de Información de Akaike (AIC) es: {p_optimo}")
+
+# ==============================================================================
+# PASO 4: ESTIMACIÓN DEL MODELO VAR(p)
+# ==============================================================================
+print("\n--- PASO 4: Estimación del Modelo ---")
+resultados_var = modelo_preliminar.fit(p_optimo)
+print(f"Modelo VAR({p_optimo}) ajustado con éxito.")
+
+# ==============================================================================
+# PASO 5 y 6: PRUEBAS DE DIAGNÓSTICO Y VALIDACIÓN ESTADÍSTICA
+# ==============================================================================
+print("\n--- PASO 5 y 6: Pruebas de Diagnóstico Estadístico ---")
+
+# A. Autocorrelación de Residuos (Durbin-Watson)
+print("\n1. Prueba Durbin-Watson (Buscamos valores ~ 2.0):")
+dw_stats = durbin_watson(resultados_var.resid)
+for col, val in zip(df_model.columns, dw_stats):
+    print(f"   {col:<10}: {val:.2f}")
+
+# B. Autocorrelación Multivariada (Test Portmanteau)
+portmanteau = resultados_var.test_whiteness(nlags=15)
+print(f"\n2. Test Portmanteau (Autocorrelación residual conjunta):")
+print(f"   p-valor = {portmanteau.pvalue:.4f} -> {'Sin autocorrelación (OK)' if portmanteau.pvalue > 0.05 else 'Presenta autocorrelación'}")
+
+# C. Normalidad de Residuos (Jarque-Bera Multivariado)
+normality = resultados_var.test_normality()
+print(f"\n3. Test Jarque-Bera Multivariado (Normalidad):")
+print(f"   p-valor = {normality.pvalue:.4f} -> {'Residuos normales (OK)' if normality.pvalue > 0.05 else 'Residuos no normales (Común en finanzas)'}")
+
+# D. Heterocedasticidad Condicional (ARCH-LM)
+print("\n4. Test ARCH-LM (Heterocedasticidad Condicional):")
+for col in df_model.columns:
+    arch_test = het_arch(resultados_var.resid[col], nlags=p_optimo)
+    print(f"   {col:<10} | p-valor: {arch_test[1]:.4e} -> {'Homocedástico' if arch_test[1] > 0.05 else 'Efecto ARCH presente'}")
+
+# E. Causalidad de Granger (Enfoque en NQH2O)
+mercado = ['SP500', 'TBOND 10', 'BMV', 'SOFR', 'MXN/USD', 'BCOM']
+gc_hacia = resultados_var.test_causality('NQH2O', mercado, kind='f')
+gc_desde = resultados_var.test_causality(mercado, 'NQH2O', kind='f')
+print("\n5. Prueba de Causalidad de Granger:")
+print(f"   Mercado -> NQH2O: p-valor = {gc_hacia.pvalue:.4f} -> {'Hay causalidad' if gc_hacia.pvalue <= 0.05 else 'No hay causalidad (OK)'}")
+print(f"   NQH2O -> Mercado: p-valor = {gc_desde.pvalue:.4f} -> {'Hay causalidad' if gc_desde.pvalue <= 0.05 else 'No hay causalidad (OK)'}")
+
+# F. Prueba de Cointegración de Johansen
+print("\n6. Prueba de Cointegración de Johansen (Traza):")
+# k_ar_diff es el rezago del VECM (usualmente p - 1)
+johansen = coint_johansen(df_model, det_order=0, k_ar_diff=p_optimo-1)
+print("   Estadístico de Traza:", np.round(johansen.lr1, 2))
+print("   Valores Críticos al 95%:", np.round(johansen.cvt[:, 1], 2))
+
+# ==============================================================================
+# PASO 7: PRONÓSTICO (FORECASTING)
+# ==============================================================================
+print("\n--- PASO 7: Pronóstico a 10 periodos ---")
+ultimos_valores = df_model.values[-p_optimo:]
+pronostico = resultados_var.forecast(y=ultimos_valores, steps=10)
+
+df_pronostico = pd.DataFrame(pronostico, 
+                             index=range(len(df_model), len(df_model) + 10),
+                             columns=[f'{col}_pred' for col in df_model.columns])
+print(df_pronostico)
+
+# ==============================================================================
+# PASO 8: FUNCIONES IMPULSO-RESPUESTA (FIR)
+# ==============================================================================
+print("\n--- PASO 8: Generando Gráficas de Impulso-Respuesta (FIR) ---")
+
+# Calculamos las funciones para 10 periodos
+irf = resultados_var.irf(periods=10)
+
+# Gráfica 1: Choque originado en NQH2O hacia el resto
+fig1 = irf.plot(impulse='NQH2O', orth=True, figsize=(12, 16))
+fig1.suptitle('Respuesta del Sistema ante un Choque en NQH2O', fontsize=18, y=0.98)
+plt.tight_layout(rect=[0, 0, 1, 0.96])
+
+# Gráfica 2: Choques de todas las variables hacia NQH2O
+fig2 = irf.plot(response='NQH2O', orth=True, figsize=(12, 16))
+fig2.suptitle('Respuesta de NQH2O ante choques en las demás variables', fontsize=18, y=0.98)
+plt.tight_layout(rect=[0, 0, 1, 0.96])
+
+print("Mostrando gráficas... (Cierra las ventanas para finalizar la ejecución del script)")
+plt.show()
